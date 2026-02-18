@@ -4,7 +4,7 @@ import Message, { TypingIndicator } from './components/Message';
 import { SYSTEM_PROMPT } from './data/profileData';
 import './styles/index.css';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+const API_URL = '';
 
 export default function App() {
   const [messages, setMessages] = useState([]);
