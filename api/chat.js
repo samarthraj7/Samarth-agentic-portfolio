@@ -1,21 +1,27 @@
-// Vercel Serverless Function: /api/chat
-// Uses Groq API (free) or OpenAI API (paid) for production
-
 export const config = { runtime: 'edge' };
 
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.1-8b-instant';
+// ── API KEY ROTATION (Edge Functions are stateless, so we use random) ────
+const GROQ_KEYS = [
+  process.env.GROQ_API_KEY_1,
+  process.env.GROQ_API_KEY_2,
+  process.env.GROQ_API_KEY_3,
+  process.env.GROQ_API_KEY, // Fallback to single key
+].filter(Boolean);
+
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.1-8b-instant';
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 
-// Priority: OpenAI > Groq
+// Random selection for Edge Functions (stateless)
+function getRandomGroqKey() {
+  if (GROQ_KEYS.length === 0) return null;
+  return GROQ_KEYS[Math.floor(Math.random() * GROQ_KEYS.length)];
+}
+
+// Determine mode
 const USE_OPENAI = !!OPENAI_API_KEY;
-const API_KEY = USE_OPENAI ? OPENAI_API_KEY : GROQ_API_KEY;
-const MODEL = USE_OPENAI ? OPENAI_MODEL : GROQ_MODEL;
-const API_URL = USE_OPENAI 
-  ? 'https://api.openai.com/v1/chat/completions'
-  : 'https://api.groq.com/openai/v1/chat/completions';
+const USE_GROQ = GROQ_KEYS.length > 0;
 
 export default async function handler(req) {
   // Handle CORS preflight
@@ -34,13 +40,6 @@ export default async function handler(req) {
     return new Response('Method Not Allowed', { status: 405 });
   }
 
-  if (!API_KEY) {
-    return new Response(
-      JSON.stringify({ error: `${USE_OPENAI ? 'OPENAI' : 'GROQ'}_API_KEY environment variable not set` }),
-      { status: 500, headers: { 'Content-Type': 'application/json' } }
-    );
-  }
-
   const { messages, systemPrompt } = await req.json();
 
   if (!messages || !Array.isArray(messages)) {
@@ -50,15 +49,39 @@ export default async function handler(req) {
     );
   }
 
+  // Choose API and get key
+  let apiKey, model, apiUrl;
+  
+  if (USE_OPENAI) {
+    apiKey = OPENAI_API_KEY;
+    model = OPENAI_MODEL;
+    apiUrl = 'https://api.openai.com/v1/chat/completions';
+  } else if (USE_GROQ) {
+    apiKey = getRandomGroqKey(); // Random selection for Edge
+    model = GROQ_MODEL;
+    apiUrl = 'https://api.groq.com/openai/v1/chat/completions';
+  } else {
+    return new Response(
+      JSON.stringify({ error: 'No API keys configured' }),
+      { 
+        status: 500, 
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
+        } 
+      }
+    );
+  }
+
   // Call LLM API with streaming
-  const llmResponse = await fetch(API_URL, {
+  const llmResponse = await fetch(apiUrl, {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${API_KEY}`,
+      'Authorization': `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      model: MODEL,
+      model: model,
       messages: [
         { role: 'system', content: systemPrompt },
         ...messages,
@@ -71,9 +94,64 @@ export default async function handler(req) {
 
   if (!llmResponse.ok) {
     const err = await llmResponse.text();
+    
+    // Parse rate limit error
+    try {
+      const errorData = JSON.parse(err);
+      const errorMsg = errorData.error?.message || '';
+      
+      // Check for rate limit
+      if (errorMsg.includes('Rate limit') || errorMsg.includes('rate_limit')) {
+        // Extract wait time - flexible regex
+        let waitTime = 30;
+        const match = errorMsg.match(/([\d.]+)s/);
+        if (match) {
+          waitTime = Math.ceil(parseFloat(match[1]));
+        }
+        
+        // Return special rate limit error in SSE format
+        const encoder = new TextEncoder();
+        const errorMessage = JSON.stringify({
+          type: 'rate_limit',
+          waitTime: waitTime,
+          message: `Rate limit reached. Please wait ${waitTime} seconds before asking another question.`
+        });
+        
+        const stream = new ReadableStream({
+          start(controller) {
+            try {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: errorMessage })}\n\n`));
+              controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+              controller.close();
+            } catch (e) {
+              controller.error(e);
+            }
+          }
+        });
+        
+        return new Response(stream, {
+          status: 200, // SSE needs 200, not 500
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
+          },
+        });
+      }
+    } catch (parseErr) {
+      // Ignore parse errors, fall through to general error
+    }
+    
     return new Response(
       JSON.stringify({ error: `${USE_OPENAI ? 'OpenAI' : 'Groq'} API error: ${err}` }),
-      { status: 500, headers: { 'Content-Type': 'application/json' } }
+      { 
+        status: 500, 
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
+        } 
+      }
     );
   }
 

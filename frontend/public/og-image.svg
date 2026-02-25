@@ -1,0 +1,40 @@
+<svg width="1200" height="630" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0f1419;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#1a1f2e;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  
+  <!-- Background -->
+  <rect width="1200" height="630" fill="url(#grad)"/>
+  
+  <!-- Glow effect -->
+  <circle cx="200" cy="150" r="300" fill="#8b5cf6" opacity="0.15" filter="blur(80px)"/>
+  <circle cx="1000" cy="500" r="250" fill="#a78bfa" opacity="0.1" filter="blur(80px)"/>
+  
+  <!-- Content -->
+  <text x="100" y="200" font-family="Arial, sans-serif" font-size="72" font-weight="bold" fill="#f3f4f6">
+    Samarth Rajendra
+  </text>
+  
+  <text x="100" y="280" font-family="Arial, sans-serif" font-size="40" fill="#9ca3af">
+    AI/ML Engineer · USC MS CS
+  </text>
+  
+  <text x="100" y="380" font-family="Arial, sans-serif" font-size="28" fill="#8b5cf6">
+    ✓ 27K+ users at British Telecom
+  </text>
+  
+  <text x="100" y="430" font-family="Arial, sans-serif" font-size="28" fill="#8b5cf6">
+    ✓ £10M potential savings
+  </text>
+  
+  <text x="100" y="480" font-family="Arial, sans-serif" font-size="28" fill="#8b5cf6">
+    ✓ 2 Springer publications
+  </text>
+  
+  <text x="100" y="560" font-family="Arial, sans-serif" font-size="24" fill="#6b7280">
+    Ask my AI assistant anything → samarthraj.com
+  </text>
+</svg>

@@ -52,9 +52,10 @@ export function TypingIndicator() {
 }
 
 export default function Message({ message }) {
-  const { role, content, timestamp, streaming, error } = message;
+  const { role, content, timestamp, streaming, error, rateLimit, waitTime } = message;
   const isBot = role === 'assistant';
   const [displayText, setDisplayText] = useState(streaming ? '' : content);
+  const [countdown, setCountdown] = useState(waitTime || 0);
 
   useEffect(() => {
     if (!streaming) {
@@ -65,8 +66,58 @@ export default function Message({ message }) {
       setDisplayText(content);
     }
   }, [content, streaming]);
+  useEffect(() => {
+    if (rateLimit && countdown > 0) {
+      const timer = setInterval(() => {
+        setCountdown(prev => Math.max(0, prev - 1));
+      }, 1000);
+      return () => clearInterval(timer);
+    }
+  }, [rateLimit, countdown]);
+  useEffect(() => {
+    if (waitTime) {
+      setCountdown(waitTime);
+    }
+  }, [waitTime]);
 
   const html = isBot ? parseMarkdown(displayText) : null;
+
+  // Special rendering for rate limit error
+  if (rateLimit && isBot) {
+    return (
+      <div className="message-row bot">
+        <div className="message-avatar bot">SR</div>
+        <div className="message-content">
+          <div className="message-bubble rate-limit">
+            <div className="rate-limit-icon">⏱️</div>
+            <div className="rate-limit-title">Rate Limit Reached</div>
+            <div className="rate-limit-message">
+              {countdown > 0 ? (
+                <>Please wait <strong>{countdown} seconds</strong> before asking another question.</>
+              ) : (
+                <>You can ask another question now!</>
+              )}
+            </div>
+            <div className="rate-limit-suggestions">
+              <div className="rate-limit-label">In the meantime:</div>
+              <a href="/resume.pdf" target="_blank" className="rate-limit-link">
+                📄 Check out my resume
+              </a>
+              <a href="https://www.linkedin.com/in/samarth-rajendra" target="_blank" rel="noreferrer" className="rate-limit-link">
+                💼 View my LinkedIn
+              </a>
+              <a href="https://github.com/samarthraj7" target="_blank" rel="noreferrer" className="rate-limit-link">
+                💻 Explore my GitHub
+              </a>
+            </div>
+          </div>
+          <div className="message-time">{formatTime(new Date(timestamp))}</div>
+        </div>
+      </div>
+    );
+  }
+
+  // const html = isBot ? parseMarkdown(displayText) : null;
 
   return (
     <div className={`message-row ${isBot ? 'bot' : 'user'}`}>

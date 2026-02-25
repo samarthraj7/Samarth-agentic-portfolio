@@ -97,6 +97,43 @@ export default function App() {
             }
             try {
               const parsed = JSON.parse(data);
+              
+              // Check for error (including rate limit)
+              if (parsed.error) {
+                console.log('Received error:', parsed.error); // ← ADD THIS DEBUG LOG
+                
+                let errorData;
+                try {
+                  errorData = JSON.parse(parsed.error);
+                } catch {
+                  errorData = { message: parsed.error };
+                }
+                
+                console.log('Parsed error data:', errorData); // ← ADD THIS DEBUG LOG
+                
+                if (errorData.type === 'rate_limit') {
+                  console.log('Rate limit detected, setting UI'); // ← ADD THIS DEBUG LOG
+                  // Rate limit error - show special UI
+                  setMessages(prev => prev.map(m =>
+                    m.id === assistantId
+                      ? { 
+                          ...m, 
+                          content: errorData.message,
+                          streaming: false,
+                          error: false,
+                          rateLimit: true,
+                          waitTime: errorData.waitTime
+                        }
+                      : m
+                  ));
+                  break; // Exit the read loop
+                } else {
+                  // General error
+                  throw new Error(errorData.message || 'Unknown error');
+                }
+              }
+              
+              // Normal token
               if (parsed.token) {
                 accumulated += parsed.token;
                 console.log('Token received, total length:', accumulated.length);
@@ -107,6 +144,9 @@ export default function App() {
                 ));
               }
             } catch (e) {
+              if (e.message === 'Rate limit handled') {
+                break;
+              }
               console.error('Parse error:', e, 'Line:', data);
             }
           }
@@ -117,9 +157,32 @@ export default function App() {
         m.id === assistantId ? { ...m, streaming: false } : m
       ));
     } catch (err) {
+      console.error('Chat error:', err);
+      
+      // Check if it's a rate limit error
+      let errorMessage = err.message || 'Connection failed. Make sure the backend is running.';
+      let isRateLimit = false;
+      let waitTime = 0;
+      
+      try {
+        const errorData = JSON.parse(err.message);
+        if (errorData.type === 'rate_limit') {
+          isRateLimit = true;
+          waitTime = errorData.waitTime;
+          errorMessage = errorData.message;
+        }
+      } catch {}
+      
       setMessages(prev => prev.map(m =>
         m.id === assistantId
-          ? { ...m, content: `⚠️ ${err.message || 'Connection failed. Make sure the backend is running.'}`, streaming: false, error: true }
+          ? { 
+              ...m, 
+              content: errorMessage,
+              streaming: false, 
+              error: true,
+              rateLimit: isRateLimit,
+              waitTime: waitTime
+            }
           : m
       ));
     } finally {
@@ -159,10 +222,10 @@ export default function App() {
         <main className="chat-main">
           {/* Topbar */}
           <div className="topbar">
-            <div className="topbar-title">Portfolio AI Assistant</div>
+            <div className="topbar-title">Samarth's Portfolio Assistant</div>
             <div className="topbar-model">
               <div className="model-indicator" />
-              {modelName} · Local
+              {modelName}
             </div>
           </div>
 
@@ -175,9 +238,9 @@ export default function App() {
                   Ask me anything about <span>Samarth</span>
                 </h1>
                 <p className="welcome-subtitle">
-                  I have deep knowledge of his experience at British Telecom,
+                  I have deep knowledge of his experiences,
                   his research on cricket analytics and agricultural AI, his
-                  technical skills, and everything on his resume.
+                  technical skills, career path and everything on his resume.
                 </p>
               </div>
             )}
@@ -217,7 +280,7 @@ export default function App() {
                 </svg>
               </button>
             </div>
-            <div className="input-hint">Enter to send · Shift+Enter for new line</div>
+            <div className="input-hint">Enter to send · Shift+Enter for new line. The Assistant can make mistakes, do check the Resume and Linkedin</div>
           </div>
         </main>
       </div>

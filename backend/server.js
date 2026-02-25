@@ -17,25 +17,79 @@ app.use(express.json({ limit: '1mb' }));
 // ── CONFIG ────────────────────────────────────────────────────────────────
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llama3.2';
-const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.1-8b-instant';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
+// ── API KEY ROTATION ──────────────────────────────────────────────────────
+// Support multiple Groq keys for 3x capacity (30 req/min per key)
+const GROQ_KEYS = [
+  process.env.GROQ_API_KEY_1,
+  process.env.GROQ_API_KEY_2,
+  process.env.GROQ_API_KEY_3,
+  process.env.GROQ_API_KEY, // Fallback to single key if using old config
+].filter(Boolean); // Remove undefined/empty keys
+
+// Track which key to use next (round-robin)
+let currentKeyIndex = 0;
+const rateLimitedKeys = new Map(); // key -> expiryTimestamp
+
+function getNextGroqKey() {
+  if (GROQ_KEYS.length === 0) return null;
+  
+  const now = Date.now();
+  
+  // Try to find a non-rate-limited key
+  for (let i = 0; i < GROQ_KEYS.length; i++) {
+    const keyIndex = (currentKeyIndex + i) % GROQ_KEYS.length;
+    const key = GROQ_KEYS[keyIndex];
+    
+    // Check if this key is rate limited
+    const rateLimitExpiry = rateLimitedKeys.get(key);
+    if (!rateLimitExpiry || now > rateLimitExpiry) {
+      // Key is available!
+      currentKeyIndex = (keyIndex + 1) % GROQ_KEYS.length;
+      return { key, index: keyIndex };
+    }
+  }
+  
+  // All keys are rate limited
+  return null;
+}
+
+function markKeyRateLimited(key, waitSeconds) {
+  const expiryTime = Date.now() + (waitSeconds * 1000);
+  rateLimitedKeys.set(key, expiryTime);
+  console.log(`⏱️  [Rate Limit] Key marked as limited for ${waitSeconds}s`);
+  
+  // Auto-clear after expiry
+  setTimeout(() => {
+    rateLimitedKeys.delete(key);
+    console.log(`✅ [Rate Limit] Key is now available again`);
+  }, waitSeconds * 1000);
+}
+
 // Determine mode: OpenAI > Groq > Ollama
 let MODE = 'ollama';
 if (OPENAI_API_KEY) MODE = 'openai';
-else if (GROQ_API_KEY || process.env.USE_GROQ === 'true') MODE = 'groq';
+else if (GROQ_KEYS.length > 0) MODE = 'groq';
 
-console.log(`🤖 Mode: ${MODE}`);
-console.log(`📡 Model: ${MODE === 'openai' ? OPENAI_MODEL : MODE === 'groq' ? GROQ_MODEL : OLLAMA_MODEL}`);
+console.log(`\n🤖 Mode: ${MODE}`);
+if (MODE === 'groq') {
+  console.log(`📡 Groq Keys: ${GROQ_KEYS.length} available (${GROQ_KEYS.length * 30} req/min total)`);
+  console.log(`📡 Model: ${GROQ_MODEL}`);
+} else {
+  console.log(`📡 Model: ${MODE === 'openai' ? OPENAI_MODEL : OLLAMA_MODEL}`);
+}
 
 // ── HEALTH CHECK ──────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     mode: MODE, 
-    model: MODE === 'openai' ? OPENAI_MODEL : MODE === 'groq' ? GROQ_MODEL : OLLAMA_MODEL 
+    model: MODE === 'openai' ? OPENAI_MODEL : MODE === 'groq' ? GROQ_MODEL : OLLAMA_MODEL,
+    groqKeys: MODE === 'groq' ? GROQ_KEYS.length : 0,
+    capacity: MODE === 'groq' ? `${GROQ_KEYS.length * 30} req/min` : 'unlimited'
   });
 });
 
@@ -134,16 +188,35 @@ async function streamOllama({ messages, systemPrompt, sendToken, sendDone, sendE
   sendDone();
 }
 
-// ── GROQ STREAMING ────────────────────────────────────────────────────────
-async function streamGroq({ messages, systemPrompt, sendToken, sendDone, sendError }) {
-  if (!GROQ_API_KEY) {
-    throw new Error('GROQ_API_KEY not set. Add it to your .env file.');
+// ── GROQ STREAMING WITH KEY ROTATION ──────────────────────────────────────
+async function streamGroq({ messages, systemPrompt, sendToken, sendDone, sendError, retryCount = 0 }) {
+  const keyData = getNextGroqKey();
+  
+  if (!keyData) {
+    // All keys are rate limited
+    console.log('⚠️  [Groq] All keys are rate limited');
+    
+    if (OPENAI_API_KEY) {
+      console.log('🔄 [Fallback] Switching to OpenAI');
+      return streamOpenAI({ messages, systemPrompt, sendToken, sendDone, sendError });
+    }
+    
+    // No fallback available - show rate limit message
+    sendError(JSON.stringify({
+      type: 'rate_limit',
+      waitTime: 60,
+      message: 'All API keys are currently rate limited. Please wait 1 minute before asking another question.'
+    }));
+    return;
   }
+  
+  const { key: apiKey, index: keyIndex } = keyData;
+  console.log(`🔑 [Groq] Using key ${keyIndex + 1}/${GROQ_KEYS.length}`);
 
   const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${GROQ_API_KEY}`,
+      'Authorization': `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
@@ -160,6 +233,46 @@ async function streamGroq({ messages, systemPrompt, sendToken, sendDone, sendErr
 
   if (!response.ok) {
     const err = await response.text();
+    console.error('❌ [Groq] API error:', err);
+    
+    // Parse rate limit error
+    try {
+      const errorData = JSON.parse(err);
+      const errorMsg = errorData.error?.message || '';
+      
+      // Check for rate limit
+      if (errorMsg.includes('Rate limit') || errorMsg.includes('rate_limit')) {
+        // Extract wait time
+        let waitTime = 30;
+        const match = errorMsg.match(/([\d.]+)s/);
+        if (match) {
+          waitTime = Math.ceil(parseFloat(match[1]));
+        }
+        
+        console.log(`⏱️  [Rate Limit] Key ${keyIndex + 1} hit limit (wait: ${waitTime}s)`);
+        
+        // Mark this key as rate limited
+        markKeyRateLimited(apiKey, waitTime);
+        
+        // Prevent infinite recursion
+        if (retryCount >= GROQ_KEYS.length) {
+          console.log('⚠️  [Rate Limit] All keys exhausted after retries');
+          sendError(JSON.stringify({
+            type: 'rate_limit',
+            waitTime: waitTime,
+            message: `Rate limit reached. Please wait ${waitTime} seconds before asking another question.`
+          }));
+          return;
+        }
+        
+        // Try next key immediately
+        console.log(`🔄 [Retry] Trying next key (attempt ${retryCount + 1}/${GROQ_KEYS.length})...`);
+        return streamGroq({ messages, systemPrompt, sendToken, sendDone, sendError, retryCount: retryCount + 1 });
+      }
+    } catch (parseErr) {
+      console.error('❌ [Groq] Error parsing response:', parseErr);
+    }
+    
     throw new Error(`Groq API error: ${err}`);
   }
 
@@ -194,6 +307,8 @@ async function streamOpenAI({ messages, systemPrompt, sendToken, sendDone, sendE
   if (!OPENAI_API_KEY) {
     throw new Error('OPENAI_API_KEY not set. Add it to your .env file.');
   }
+
+  console.log('[OpenAI] Using OpenAI API');
 
   const response = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
