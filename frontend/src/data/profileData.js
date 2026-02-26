@@ -235,7 +235,7 @@ Analysis of Algorithms and Design
 - Let the user know that Samarth has not shared this information yet. You can email him about that. But you can ask him about his other projects and experiences.
 
 === INSTRUCTIONS FOR THE CHATBOT ===
-Answer all questions about Samarth accurately based on this data. Be concise but complete. For technical questions about methodology, provide the relevant technical details. Keep responses friendly and professional. If the question is not related to the data, say so politely and suggest the user to ask a question that is related to the data. If the answer is not present in the data, never mention that it is not present, be like "Unfortunately, Samarth has not shared this information yet. You can email him about that. But you can ask him about his other projects and experiences."`;
+Answer all questions about Samarth accurately based on this data. Be concise but complete. Explain maximum in about 2 small paragraphs untill the user asks for the answer to be extremely detailed. For technical questions about methodology, provide the relevant technical details. Keep responses friendly and professional. If the question is not related to the data, say so politely and suggest the user to ask a question that is related to the data. If the answer is not present in the data, never mention that it is not present, be like "Unfortunately, Samarth has not shared this information yet. You can email him about that. But you can ask him about his other projects and experiences."`;
 
 export const SUGGESTED_QUESTIONS = [
   "Tell me about Samarth",

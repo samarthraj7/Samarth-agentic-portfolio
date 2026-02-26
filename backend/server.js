@@ -22,13 +22,18 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
 // ── API KEY ROTATION ──────────────────────────────────────────────────────
-// Support multiple Groq keys for 3x capacity (30 req/min per key)
-const GROQ_KEYS = [
-  process.env.GROQ_API_KEY_1,
-  process.env.GROQ_API_KEY_2,
-  process.env.GROQ_API_KEY_3,
-  process.env.GROQ_API_KEY, // Fallback to single key if using old config
-].filter(Boolean); // Remove undefined/empty keys
+// Support up to 10 Groq keys for maximum capacity
+const GROQ_KEYS = [];
+for (let i = 1; i <= 10; i++) {
+  const key = process.env[`GROQ_API_KEY_${i}`];
+  if (key) GROQ_KEYS.push(key);
+}
+// Fallback to old single key format
+if (process.env.GROQ_API_KEY && !GROQ_KEYS.includes(process.env.GROQ_API_KEY)) {
+  GROQ_KEYS.push(process.env.GROQ_API_KEY);
+}
+
+console.log(`🔑 Loaded ${GROQ_KEYS.length} Groq API keys`);
 
 // Track which key to use next (round-robin)
 let currentKeyIndex = 0;
@@ -60,7 +65,7 @@ function getNextGroqKey() {
 function markKeyRateLimited(key, waitSeconds) {
   const expiryTime = Date.now() + (waitSeconds * 1000);
   rateLimitedKeys.set(key, expiryTime);
-  console.log(`⏱️  [Rate Limit] Key marked as limited for ${waitSeconds}s`);
+  console.log(`⏱️  [Rate Limit] Key marked as limited for ${waitSeconds}s (expires at ${new Date(expiryTime).toLocaleTimeString()})`);
   
   // Auto-clear after expiry
   setTimeout(() => {
@@ -153,7 +158,7 @@ async function streamOllama({ messages, systemPrompt, sendToken, sendDone, sendE
       options: {
         temperature: 0.7,
         top_p: 0.9,
-        num_predict: 1024,
+        num_predict: 512,
       },
     }),
   });
@@ -201,11 +206,25 @@ async function streamGroq({ messages, systemPrompt, sendToken, sendDone, sendErr
       return streamOpenAI({ messages, systemPrompt, sendToken, sendDone, sendError });
     }
     
+    // Find the minimum wait time from all rate-limited keys
+    const now = Date.now();
+    let minWaitTime = 60; // Fallback only if we can't determine
+    
+    for (const [key, expiryTime] of rateLimitedKeys.entries()) {
+      const remainingMs = expiryTime - now;
+      const remainingSec = Math.ceil(remainingMs / 1000);
+      if (remainingSec > 0 && remainingSec < minWaitTime) {
+        minWaitTime = remainingSec;
+      }
+    }
+    
+    console.log(`⏱️  [All Limited] Shortest wait time: ${minWaitTime}s`);
+    
     // No fallback available - show rate limit message
     sendError(JSON.stringify({
       type: 'rate_limit',
-      waitTime: 60,
-      message: 'All API keys are currently rate limited. Please wait 1 minute before asking another question.'
+      waitTime: minWaitTime,
+      message: `All API keys are currently rate limited. Please wait ${minWaitTime} seconds before asking another question.`
     }));
     return;
   }
@@ -226,14 +245,13 @@ async function streamGroq({ messages, systemPrompt, sendToken, sendDone, sendErr
         ...messages,
       ],
       stream: true,
-      max_tokens: 1024,
+      max_tokens: 512,
       temperature: 0.7,
     }),
   });
 
   if (!response.ok) {
     const err = await response.text();
-    console.error('❌ [Groq] API error:', err);
     
     // Parse rate limit error
     try {
@@ -242,31 +260,25 @@ async function streamGroq({ messages, systemPrompt, sendToken, sendDone, sendErr
       
       // Check for rate limit
       if (errorMsg.includes('Rate limit') || errorMsg.includes('rate_limit')) {
-        // Extract wait time
-        let waitTime = 30;
-        const match = errorMsg.match(/([\d.]+)s/);
-        if (match) {
-          waitTime = Math.ceil(parseFloat(match[1]));
+        console.log('📋 [Full Error]:', errorMsg);
+        
+        // Extract wait time: "Please try again in 54.17s"
+        const match = errorMsg.match(/try again in ([\d.]+)s/i);
+        
+        if (!match) {
+          console.error('❌ [Parse Error] Could not extract wait time from:', errorMsg);
+          throw new Error(`Groq rate limit with unparseable wait time: ${errorMsg}`);
         }
         
-        console.log(`⏱️  [Rate Limit] Key ${keyIndex + 1} hit limit (wait: ${waitTime}s)`);
+        const waitTime = Math.ceil(parseFloat(match[1]));
+        console.log(`⏱️  [Rate Limit] Key ${keyIndex + 1} hit limit`);
+        console.log(`   Parsed wait time: ${match[1]}s → rounded to ${waitTime}s`);
         
         // Mark this key as rate limited
         markKeyRateLimited(apiKey, waitTime);
         
-        // Prevent infinite recursion
-        if (retryCount >= GROQ_KEYS.length) {
-          console.log('⚠️  [Rate Limit] All keys exhausted after retries');
-          sendError(JSON.stringify({
-            type: 'rate_limit',
-            waitTime: waitTime,
-            message: `Rate limit reached. Please wait ${waitTime} seconds before asking another question.`
-          }));
-          return;
-        }
-        
         // Try next key immediately
-        console.log(`🔄 [Retry] Trying next key (attempt ${retryCount + 1}/${GROQ_KEYS.length})...`);
+        console.log(`🔄 [Retry] Trying next key (attempt ${retryCount + 1})...`);
         return streamGroq({ messages, systemPrompt, sendToken, sendDone, sendError, retryCount: retryCount + 1 });
       }
     } catch (parseErr) {
@@ -323,7 +335,7 @@ async function streamOpenAI({ messages, systemPrompt, sendToken, sendDone, sendE
         ...messages,
       ],
       stream: true,
-      max_tokens: 1024,
+      max_tokens: 512,
       temperature: 0.7,
     }),
   });

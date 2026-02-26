@@ -1,3 +1,6 @@
+// Vercel Serverless Function: /api/chat
+// Uses Groq API (free) with key rotation or OpenAI API (paid) for production
+
 export const config = { runtime: 'edge' };
 
 // ── API KEY ROTATION (Edge Functions are stateless, so we use random) ────
@@ -5,6 +8,8 @@ const GROQ_KEYS = [
   process.env.GROQ_API_KEY_1,
   process.env.GROQ_API_KEY_2,
   process.env.GROQ_API_KEY_3,
+  process.env.GROQ_API_KEY_4,
+  process.env.GROQ_API_KEY_5,
   process.env.GROQ_API_KEY, // Fallback to single key
 ].filter(Boolean);
 
@@ -17,6 +22,16 @@ const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 function getRandomGroqKey() {
   if (GROQ_KEYS.length === 0) return null;
   return GROQ_KEYS[Math.floor(Math.random() * GROQ_KEYS.length)];
+}
+
+// Shuffle array to try keys in random order
+function shuffleKeys() {
+  const shuffled = [...GROQ_KEYS];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled;
 }
 
 // Determine mode
@@ -49,31 +64,76 @@ export default async function handler(req) {
     );
   }
 
-  // Choose API and get key
-  let apiKey, model, apiUrl;
-  
+  // If using OpenAI, use it directly (no rotation needed)
   if (USE_OPENAI) {
-    apiKey = OPENAI_API_KEY;
-    model = OPENAI_MODEL;
-    apiUrl = 'https://api.openai.com/v1/chat/completions';
-  } else if (USE_GROQ) {
-    apiKey = getRandomGroqKey(); // Random selection for Edge
-    model = GROQ_MODEL;
-    apiUrl = 'https://api.groq.com/openai/v1/chat/completions';
-  } else {
-    return new Response(
-      JSON.stringify({ error: 'No API keys configured' }),
-      { 
-        status: 500, 
-        headers: { 
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
-        } 
-      }
-    );
+    return await callLLM({
+      apiKey: OPENAI_API_KEY,
+      model: OPENAI_MODEL,
+      apiUrl: 'https://api.openai.com/v1/chat/completions',
+      messages,
+      systemPrompt,
+      isOpenAI: true,
+    });
   }
 
-  // Call LLM API with streaming
+  // If using Groq, try keys with retry logic
+  if (USE_GROQ) {
+    const keysToTry = shuffleKeys(); // Random order
+    let lastError = null;
+    let lastWaitTime = 30;
+
+    // Try each key once
+    for (let i = 0; i < keysToTry.length; i++) {
+      const apiKey = keysToTry[i];
+      console.log(`[Groq] Attempt ${i + 1}/${keysToTry.length}`);
+
+      try {
+        const result = await callLLM({
+          apiKey: apiKey,
+          model: GROQ_MODEL,
+          apiUrl: 'https://api.groq.com/openai/v1/chat/completions',
+          messages,
+          systemPrompt,
+          isOpenAI: false,
+        });
+
+        // If we get here, the call succeeded
+        return result;
+
+      } catch (error) {
+        // Check if it's a rate limit error
+        if (error.isRateLimit) {
+          console.log(`[Groq] Key ${i + 1} rate limited, trying next...`);
+          lastError = error;
+          lastWaitTime = error.waitTime || 30;
+          continue; // Try next key
+        } else {
+          // Other error, don't retry
+          throw error;
+        }
+      }
+    }
+
+    // All keys failed with rate limit
+    console.log('[Groq] All keys rate limited');
+    return createRateLimitResponse(lastWaitTime);
+  }
+
+  // No API keys configured
+  return new Response(
+    JSON.stringify({ error: 'No API keys configured' }),
+    { 
+      status: 500, 
+      headers: { 
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
+      } 
+    }
+  );
+}
+
+// ── CALL LLM API ──────────────────────────────────────────────────────────
+async function callLLM({ apiKey, model, apiUrl, messages, systemPrompt, isOpenAI }) {
   const llmResponse = await fetch(apiUrl, {
     method: 'POST',
     headers: {
@@ -87,7 +147,7 @@ export default async function handler(req) {
         ...messages,
       ],
       stream: true,
-      max_tokens: 1024,
+      max_tokens: 512,
       temperature: 0.7,
     }),
   });
@@ -102,57 +162,26 @@ export default async function handler(req) {
       
       // Check for rate limit
       if (errorMsg.includes('Rate limit') || errorMsg.includes('rate_limit')) {
-        // Extract wait time - flexible regex
-        let waitTime = 30;
+        // Extract wait time
+        let waitTime = 10;
         const match = errorMsg.match(/([\d.]+)s/);
         if (match) {
           waitTime = Math.ceil(parseFloat(match[1]));
         }
         
-        // Return special rate limit error in SSE format
-        const encoder = new TextEncoder();
-        const errorMessage = JSON.stringify({
-          type: 'rate_limit',
-          waitTime: waitTime,
-          message: `Rate limit reached. Please wait ${waitTime} seconds before asking another question.`
-        });
-        
-        const stream = new ReadableStream({
-          start(controller) {
-            try {
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: errorMessage })}\n\n`));
-              controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-              controller.close();
-            } catch (e) {
-              controller.error(e);
-            }
-          }
-        });
-        
-        return new Response(stream, {
-          status: 200, // SSE needs 200, not 500
-          headers: {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-            'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
-          },
-        });
+        // Throw special error so we can retry
+        const rateLimitError = new Error('Rate limit');
+        rateLimitError.isRateLimit = true;
+        rateLimitError.waitTime = waitTime;
+        throw rateLimitError;
       }
-    } catch (parseErr) {
-      // Ignore parse errors, fall through to general error
+    } catch (e) {
+      if (e.isRateLimit) throw e; // Re-throw rate limit errors
+      // Otherwise fall through to general error
     }
     
-    return new Response(
-      JSON.stringify({ error: `${USE_OPENAI ? 'OpenAI' : 'Groq'} API error: ${err}` }),
-      { 
-        status: 500, 
-        headers: { 
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
-        } 
-      }
-    );
+    // General API error
+    throw new Error(`${isOpenAI ? 'OpenAI' : 'Groq'} API error: ${err}`);
   }
 
   // Transform LLM SSE stream → our SSE format
@@ -201,6 +230,38 @@ export default async function handler(req) {
   })();
 
   return new Response(readable, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
+    },
+  });
+}
+
+// ── CREATE RATE LIMIT RESPONSE ────────────────────────────────────────────
+function createRateLimitResponse(waitTime) {
+  const encoder = new TextEncoder();
+  const errorMessage = JSON.stringify({
+    type: 'rate_limit',
+    waitTime: waitTime,
+    message: `Rate limit reached. Please wait ${waitTime} seconds before asking another question.`
+  });
+  
+  const stream = new ReadableStream({
+    start(controller) {
+      try {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: errorMessage })}\n\n`));
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        controller.close();
+      } catch (e) {
+        controller.error(e);
+      }
+    }
+  });
+  
+  return new Response(stream, {
+    status: 200,
     headers: {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
